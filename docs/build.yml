@@ -1,0 +1,15 @@
+dependencies:
+- python=3.10
+- pip
+- pip:
+  - ruff
+  - sphinx
+  - furo
+  - myst_parser
+  - myst-nb
+  - sphinx-material
+  - sphinx-togglebutton
+  - sphinx-copybutton
+  - sphinx-design
+  - sphinx-inline-tabs
+  - sphinxcontrib-googleanalytics
