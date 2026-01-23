@@ -6,19 +6,24 @@ import logging
 import reprlib
 from collections.abc import Iterable
 from itertools import islice
+from scipy.signal import argrelextrema
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Type, overload
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import pandas as pd
 from joblib.parallel import Parallel, delayed
 from pandas.core.internals import ArrayManager, BlockManager  # type: ignore
 from typing_extensions import Self
-
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tsa.stl._stl import STL
+from scipy import stats
 from autogluon.common.loaders import load_pd
 
 logger = logging.getLogger(__name__)
-
+logging.getLogger().setLevel(logging.DEBUG)
 
 plt.rcParams["font.sans-serif"] = ["AR PL UKai CN", "WenQuanYi Zen Hei", "Droid Sans Fallback", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False  # 解决负号乱码问题
@@ -163,7 +168,7 @@ class TimeSeriesDataFrame(pd.DataFrame):
     def _constructor_from_mgr(self, mgr, axes):
         # Use the default constructor when constructing from _mgr. Otherwise pandas enters an infinite recursion by
         # repeatedly calling TimeSeriesDataFrame constructor
-        df = self._from_mgr(mgr, axes=axes)
+        df = self._from_mgr(mgr, axes=axes)    # type: ignore
         df._static_features = self._static_features
         return df
 
@@ -236,95 +241,595 @@ class TimeSeriesDataFrame(pd.DataFrame):
             raise ValueError(f"all entries in index `{cls.ITEMID}` must be of integer or string dtype")
 
 
-    def _compute_missing_rate_KANG(self, target_column: str | None = None) -> pd.DataFrame:
-        """计算每个时间序列的缺失率。
-        
-        Parameters
-        ----------
-        target_column : str, optional
-            要计算缺失率的列名，默认为所有数值列
-            
-        Returns
-        -------
-        pd.DataFrame
-            包含每个item_id缺失率的DataFrame
+    def _compute_missing_rate_KANG(self) -> dict:
         """
-        if target_column is None:
-            # 计算所有列的缺失率
-            missing_stats = []
+        计算每个 item_id 在所有列上的缺失率，仅用于日志输出
+        """
+
+        try:
+            results = []
+            missing_dict = {}
+
             for col in self.columns:
-                missing_rate = self[col].isna().groupby(level=self.ITEMID).mean()
-                missing_stats.append(pd.DataFrame({
-                    'column': col,
-                    'missing_rate': missing_rate
-                }))
-            return pd.concat(missing_stats)
-        else:
-            missing_rate = self[target_column].isna().groupby(level=self.ITEMID).mean()
-            return pd.DataFrame({
-                'item_id': missing_rate.index,
-                'missing_rate': missing_rate.values
-            })
+                try:
+                    missing_rate = (
+                        self[col]
+                        .isna()
+                        .groupby(level=self.ITEMID)
+                        .mean()
+                    )
+
+                    results.append(pd.DataFrame({
+                        "item_id": missing_rate.index,
+                        "column": col,
+                        "missing_rate": missing_rate.values
+                    }))
+
+                    # 用于返回的字典
+                    for item_id, rate in missing_rate.items():
+                        missing_dict[(item_id, col)] = float(rate)
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to compute missing rate for column '{col}': {e}"
+                    )
+
+            if not results:
+                logger.warning("No missing rate statistics were computed.")
+
+            # 合并结果
+            missing_df = pd.concat(results, ignore_index=True)
+
+            # 取缺失率最高的 Top N
+            top = (
+                missing_df
+                .sort_values("missing_rate", ascending=False)
+            )
+
+            logger.info("Top missing rates by item_id and column:")
+            for i, row in enumerate(top.itertuples(index=False), start=1):
+                logger.info(
+                    f"  {i}. Item {row.item_id}, Column '{row.column}': "
+                    f"{row.missing_rate:.2%}"
+                )
+
+            return missing_dict
+
+        except Exception as e:
+            logger.warning(f"Could not compute missing rate: {e}")
+            return {}
+        
 
     def _plot_distribution_KANG(
         self,
-        target_column: str,
         bins: int = 50,
         figsize: tuple = (10, 6),
         save: bool = True,
-        save_dir: str = "results/Analysis_Visualization",
+        save_dir: str = "results/plot",
         dpi: int = 300
+    ) -> dict:
+        """
+        为所有列绘制分布直方图（每列一张），并返回直方图数据
+
+        Returns
+        -------
+        dict
+            {
+                column_name: {
+                    "bins": np.ndarray,
+                    "counts": np.ndarray,
+                    "total_points": int
+                }
+            }
+        """
+
+        hist_dict = {}
+
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+
+            for col in self.columns:
+                try:
+                    data = self[col].dropna()
+                    if data.empty:
+                        continue
+
+                    # ======================
+                    # 0. 先用 numpy 计算直方图（这是“数据源”）
+                    # ======================
+                    counts, bin_edges = np.histogram(data, bins=bins)
+
+                    hist_dict[col] = {
+                        "bins": bin_edges,
+                        "counts": counts,
+                        "total_points": int(len(data))
+                    }
+
+                    # ======================
+                    # 1. 开始画图
+                    # ======================
+                    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+                    # ---- 总体分布（用同一套 bins）
+                    axes[0].hist(
+                        data,
+                        bins=bin_edges,
+                        edgecolor="black",
+                        alpha=0.7
+                    )
+                    axes[0].set_xlabel(col)
+                    axes[0].set_ylabel("Frequency")
+                    axes[0].set_title(f"Overall Distribution of {col}")
+                    axes[0].grid(True, alpha=0.3)
+
+                    # ======================
+                    # 2. 按 item_id 分布（抽样）
+                    # ======================
+                    if self.num_items > 10:
+                        sampled_items = self.item_ids[:10]
+                    else:
+                        sampled_items = self.item_ids
+
+                    for item_id in sampled_items:
+                        try:
+                            item_data = self.loc[item_id][col].dropna()
+                            if not item_data.empty:
+                                axes[1].hist(
+                                    item_data,
+                                    bins=bin_edges,
+                                    alpha=0.5,
+                                    label=str(item_id)
+                                )
+                        except Exception:
+                            continue
+
+                    axes[1].legend(
+                        title="Item ID",
+                        bbox_to_anchor=(1.05, 1),
+                        loc="upper left"
+                    )
+                    axes[1].set_xlabel(col)
+                    axes[1].set_ylabel("Frequency")
+                    axes[1].set_title("Distribution by Item (sampled)")
+                    axes[1].grid(True, alpha=0.3)
+
+                    plt.tight_layout()
+
+                    # ======================
+                    # 3. 保存
+                    # ======================
+                    if save:
+                        save_path = os.path.join(
+                            save_dir,
+                            f"distribution_{col}.png"
+                        )
+                        fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+                    plt.close(fig)
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to plot distribution for column '{col}': {e}"
+                    )
+
+            return hist_dict
+
+        except Exception as e:
+            logger.warning(f"Could not generate distribution plots: {e}")
+            return {}
+
+
+    def _adjust_period(self, period_value: int) -> int:
+        """
+        【辅助方法】周期调整
+        逻辑源自 Characteristics_Extractor.py
+        """
+
+        if abs(period_value - 4) <= 1: return 4
+        if abs(period_value - 7) <= 1: return 7
+        if abs(period_value - 12) <= 2: return 12
+        if abs(period_value - 24) <= 3: return 24
+        if abs(period_value - 48) <= 1 or ((48 - period_value) <= 4 and (48 - period_value) >= 0): return 48
+        if abs(period_value - 52) <= 2: return 52
+        if abs(period_value - 96) <= 10: return 96
+        if abs(period_value - 144) <= 10: return 144
+        if abs(period_value - 168) <= 10: return 168
+        if abs(period_value - 336) <= 50: return 336
+        if abs(period_value - 672) <= 20: return 672
+        if abs(period_value - 720) <= 20: return 720
+        if abs(period_value - 1008) <= 100: return 1008
+        if abs(period_value - 1440) <= 200: return 1440
+        if abs(period_value - 8766) <= 500: return 8766
+        if abs(period_value - 10080) <= 500: return 10080
+        return period_value
+
+    def _fft_transfer(self, timeseries: np.ndarray, fmin: float = 0.0):
+        try:
+            # 检查数据长度
+            if len(timeseries) < 10:
+                logger.debug(f"Timeseries too short for FFT (len={len(timeseries)})")
+                return [], []
+            
+            # 去除NaN
+            timeseries = timeseries[~np.isnan(timeseries)]
+            if len(timeseries) < 10:
+                logger.debug(f"Valid data too short after removing NaN (len={len(timeseries)})")
+                return [], []
+            
+            # 1. 计算FFT
+            n = len(timeseries)
+            yf = np.fft.fft(timeseries)
+            
+            # 2. 计算振幅谱
+            amplitude = np.abs(yf) / n  # 归一化
+            amplitude = amplitude[:n//2] * 2  # 单边谱
+            
+            # 3. 计算频率
+            sampling_rate = 1.0  # 假设单位时间采样
+            freqs = np.fft.fftfreq(n, d=1.0)[:n//2]
+            
+            # 4. 寻找峰值（更宽松的条件）
+            from scipy.signal import find_peaks
+            
+            # 设置峰值检测参数
+            height_threshold = np.percentile(amplitude, 70)  # 取前30%的振幅作为阈值
+            peaks, properties = find_peaks(
+                amplitude, 
+                height=height_threshold,
+                distance=max(2, n//20)  # 峰值之间最小距离
+            )
+            
+            if len(peaks) == 0:
+                # 如果没找到峰值，尝试降低阈值
+                height_threshold = np.mean(amplitude)
+                peaks, properties = find_peaks(
+                    amplitude,
+                    height=height_threshold,
+                    distance=max(2, n//20)
+                )
+            
+            if len(peaks) == 0:
+                logger.debug(f"No significant peaks found in FFT analysis")
+                return [], []
+            
+            # 5. 提取前几个主要周期
+            significant_peaks = peaks[:min(5, len(peaks))]  # 最多取5个主要峰值
+            
+            # 6. 计算周期（周期 = 1 / 频率）
+            periods = []
+            amplitudes = []
+            
+            for idx in significant_peaks:
+                freq = freqs[idx]
+                if freq > 0:  # 忽略零频率（直流分量）
+                    period = 1.0 / freq
+                    # 只保留合理的周期（不能超过数据长度）
+                    if 2 <= period <= n/2:
+                        periods.append(period)
+                        amplitudes.append(amplitude[idx])
+            
+            # 按振幅降序排序
+            if periods:
+                sorted_idx = np.argsort(amplitudes)[::-1]
+                periods = np.array(periods)[sorted_idx].tolist()
+                amplitudes = np.array(amplitudes)[sorted_idx].tolist()
+            
+            logger.debug(f"FFT found {len(periods)} periods: {periods[:5]}")
+            return periods, amplitudes
+            
+        except Exception as e:
+            logger.error(f"Error during FFT transfer: {str(e)}", exc_info=True)
+            return [], []
+
+
+
+    def _spatiotemporal_heterogeneity_analysis_KANG(
+        self,
+        target_column: str,
+        max_items: int = 10,
+        save: bool = True,
+        save_dir: str = "results/plot",
     ):
-        """绘制目标列的分布直方图，并可选择保存图片"""
-
-
-        fig, axes = plt.subplots(1, 2, figsize=figsize)
-
-        # ======================
-        # 1. 总体分布
-        # ======================
-        data = self[target_column].dropna()
-        axes[0].hist(data, bins=bins, edgecolor='black', alpha=0.7)
-        axes[0].set_xlabel(target_column)
-        axes[0].set_ylabel('Frequency')
-        axes[0].set_title(f'Overall Distribution of {target_column}')
-        axes[0].grid(True, alpha=0.3)
-
-        # ======================
-        # 2. 按 item_id 分布（抽样）
-        # ======================
-        if self.num_items > 10:
-            sampled_items = self.item_ids[:10]
-        else:
-            sampled_items = self.item_ids
-
-        for item_id in sampled_items:
-            item_data = self.loc[item_id][target_column].dropna()
-            if len(item_data) > 0:
-                axes[1].hist(item_data, bins=20, alpha=0.5, label=str(item_id))
-
-        axes[1].legend(title='Item ID', bbox_to_anchor=(1.05, 1), loc='upper left')
-        axes[1].set_xlabel(target_column)
-        axes[1].set_ylabel('Frequency')
-        axes[1].set_title('Distribution by Item (sampled)')
-        axes[1].grid(True, alpha=0.3)
-
-        plt.tight_layout()
-
-        # ======================
-        # 3. 保存图片（自动建目录）
-        # ======================
+        """
+        带 Logging 和 Visualization 的时空异质性分析 (FFT/STL/ADF-KPSS)
+        """
+        DEFAULT_PERIODS = [4, 7, 12, 24, 48, 52, 96, 144, 168, 336, 672, 1008, 1440]
+        
         if save:
             os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(
-                save_dir,
-                f"distribution_{target_column}.png"
+            logger.info(f"Results will be saved to: {save_dir}")
+            # 设置 seaborn 风格，支持中文显示（根据系统字体调整，这里用默认）
+            sns.set_theme(style="whitegrid")
+            plt.rcParams['axes.unicode_minus'] = False 
+        
+        # 抽样逻辑
+        if hasattr(self, 'num_items') and self.num_items > max_items:
+            sampled_items = self.item_ids[:max_items]
+            logger.info(f"Sampling {max_items} items from total {self.num_items}.")
+        else:
+            sampled_items = getattr(self, 'item_ids', [])
+            logger.info(f"Processing all {len(sampled_items)} items.")
+
+        results = {
+            'trend_analysis': {},
+            'seasonal_analysis': {},
+            'stationarity_analysis': {}
+        }
+        
+        count_processed = 0
+        count_skipped = 0
+
+        for item_id in sampled_items:
+            # 数据读取与基础校验
+            try:
+                item_df = self.loc[item_id]
+                if target_column not in item_df.columns:
+                    logger.warning(f"Item {item_id}: Column '{target_column}' not found. Skipping.")
+                    count_skipped += 1
+                    continue
+                item_series = item_df[target_column].dropna()
+            except Exception as e:
+                logger.error(f"Item {item_id}: Error accessing data - {str(e)}")
+                count_skipped += 1
+                continue
+
+            series_values = item_series.values.astype("float")
+            series_length = len(series_values)
+            
+            # 长度校验
+            if series_length < 12:
+                logger.warning(f"Item {item_id}: Series too short (len={series_length} < 12). Skipping.")
+                count_skipped += 1
+                continue
+
+            logger.debug(f"Processing Item {item_id} (len={series_length})...")
+
+            # 1. 平稳性分析 (Stationarity)
+            try:
+                adf_res = adfuller(series_values, autolag="AIC")
+                adf_p = adf_res[1]
+                
+                kpss_res = kpss(series_values, regression="c", nlags="auto")
+                kpss_p = kpss_res[1]
+                
+                # line 284 logic
+                is_stable = (adf_p <= 0.05) or (kpss_p >= 0.05)
+                
+                logger.debug(f"Item {item_id}: Stationarity - ADF p={adf_p:.4f}, KPSS p={kpss_p:.4f}, Stable={is_stable}")
+                
+            except Exception as e:
+                logger.error(f"Item {item_id}: Stationarity test failed - {str(e)}")
+                adf_p, kpss_p, is_stable = None, None, False
+            
+            stat_info = {
+                "adf_p_value": adf_p,
+                "kpss_p_value": kpss_p,
+                "is_stable": is_stable,
+                "mean": np.mean(series_values),
+                "std": np.std(series_values)
+            }
+            results['stationarity_analysis'][str(item_id)] = stat_info
+
+            # 2. 周期检测 (FFT)
+            fft_periods, fft_amps = self._fft_transfer(series_values, fmin=0)
+            
+            detected_periods = []
+            if len(fft_amps) > 0:
+                sorted_idx = np.argsort(fft_amps)[::-1]
+                for idx in sorted_idx:
+                    detected_periods.append(round(fft_periods[idx]))
+            
+            # 映射与去重
+            candidate_periods = []
+            for p in detected_periods:
+                adj_p = self._adjust_period(p)
+                if adj_p not in candidate_periods and adj_p >= 4:
+                    candidate_periods.append(adj_p)
+            
+            # 最终候选列表
+            periods_num = min(len(candidate_periods), 3)
+            final_periods_check = candidate_periods[:periods_num] + DEFAULT_PERIODS
+            
+            final_periods = []
+            for p in final_periods_check:
+                if p not in final_periods and p >= 4:
+                    final_periods.append(p)
+            
+            logger.info(f"Item {item_id}: Top FFT periods: {detected_periods[:3]} -> Check periods: {final_periods[:5]}...")
+
+            # 3. 趋势与季节强度 (STL)
+            season_dict = {}
+            threshold_len = max(int(series_length / 3), 12)
+            
+            for period_val in final_periods:
+                if period_val < threshold_len:
+                    try:
+                        res = STL(item_series, period=period_val).fit()
+                        
+                        resid = res.resid
+                        trend = res.trend
+                        seasonal = res.seasonal
+                        
+                        deseasonal = item_series - seasonal
+                        detrend = item_series - trend
+                        
+                        # 趋势强度
+                        var_deseasonal = np.var(deseasonal)
+                        t_strength = 0 if var_deseasonal == 0 else max(0, 1 - np.var(resid) / var_deseasonal)
+                        
+                        # 季节强度
+                        var_detrend = np.var(detrend)
+                        s_strength = 0 if var_detrend == 0 else max(0, 1 - np.var(resid) / var_detrend)
+                        
+                        season_dict[s_strength] = {
+                            "period": period_val,
+                            "seasonal_strength": s_strength,
+                            "trend_strength": t_strength,
+                            "stl_res": res # 暂存 STL 结果用于绘图 (可选，如果内存够大)
+                        }
+                    except Exception as e:
+                        logger.debug(f"Item {item_id}: STL failed for period {period_val} - {str(e)}")
+                        continue
+            
+            # 提取最佳结果
+            best_seasonal_strength = 0
+            best_trend_strength = 0
+            best_period = 0
+            best_stl_res = None
+            
+            if season_dict:
+                max_s_key = max(season_dict.keys())
+                best_entry = season_dict[max_s_key]
+                
+                best_seasonal_strength = best_entry['seasonal_strength']
+                best_trend_strength = best_entry['trend_strength']
+                best_period = best_entry['period']
+                best_stl_res = best_entry.get('stl_res') # 获取对应的 STL 结果对象
+            
+            has_trend = best_trend_strength >= 0.85
+            has_season = best_seasonal_strength >= 0.9
+
+            logger.info(
+                f"Item {item_id} Finished: "
+                f"Trend={best_trend_strength:.2f} (HasTrend={has_trend}), "
+                f"Season={best_seasonal_strength:.2f} (HasSeason={has_season}, Period={best_period})"
             )
-            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-            print(f"[Saved] {save_path}")
 
-        return fig
+            results['trend_analysis'][str(item_id)] = {
+                "trend_strength": best_trend_strength,
+                "has_significant_trend": has_trend
+            }
+            
+            results['seasonal_analysis'][str(item_id)] = {
+                "dominant_period": best_period,
+                "seasonal_strength": best_seasonal_strength,
+                "has_significant_seasonality": has_season
+            }
 
+            # 4. 可视化 (Visualization)
+            if save:
+                self._plot_analysis_result(
+                    item_id=item_id,
+                    series=item_series,
+                    stat_info=stat_info,
+                    best_period=best_period,
+                    best_stl_res=best_stl_res,
+                    save_dir=save_dir
+                )
+            
+            count_processed += 1
+
+        logger.info(f"Analysis Complete. Processed: {count_processed}, Skipped: {count_skipped}")
+        return results
+
+
+    def _plot_analysis_result(self, item_id, series, stat_info, best_period, best_stl_res, save_dir):
+        """
+        可视化：平稳性、周期性(FFT)、趋势与季节性(STL)
+        """
+        try:
+            # 创建 3x1 的画布
+            fig, axes = plt.subplots(3, 1, figsize=(14, 15), constrained_layout=True)
+            fig.suptitle(f"Spatio-Temporal Analysis: Item {item_id}", fontsize=16, fontweight='bold')
+
+            # --- 图1: 原始序列 & 平稳性检测 ---
+            ax1 = axes[0]
+            ax1.plot(series.values, color='#1f77b4', alpha=0.8, label='Observed')
+            ax1.set_title("1. Stationarity Analysis (ADF & KPSS)", fontsize=12, fontweight='bold', loc='left')
+            
+            # 构建标注文本
+            adf_p = stat_info.get('adf_p_value')
+            kpss_p = stat_info.get('kpss_p_value')
+            is_stable = stat_info.get('is_stable')
+            
+            stat_text = (
+                f"Mean: {stat_info.get('mean', 0):.2f}, Std: {stat_info.get('std', 0):.2f}\n"
+                f"ADF p-value: {adf_p:.4f} " + ("(Stationary)" if adf_p and adf_p <= 0.05 else "(Non-Stationary)") + "\n"
+                f"KPSS p-value: {kpss_p:.4f} " + ("(Stationary)" if kpss_p and kpss_p >= 0.05 else "(Non-Stationary)") + "\n"
+                f"Result: {'STABLE' if is_stable else 'UNSTABLE'}"
+            )
+            
+            # 在图中添加文本框
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.3)
+            ax1.text(0.02, 0.95, stat_text, transform=ax1.transAxes, fontsize=10,
+                    verticalalignment='top', bbox=props)
+            ax1.legend(loc='upper right')
+            ax1.set_ylabel("Value")
+
+            # --- 图2: 周期性分析 (FFT Spectrum) ---
+            ax2 = axes[1]
+            ax2.set_title("2. Periodicity Analysis (FFT Spectrum)", fontsize=12, fontweight='bold', loc='left')
+            
+            # 重新计算一次完整的 FFT 用于绘图 (因为 _fft_transfer 只返回了 top peaks)
+            vals = series.values
+            vals = vals[~np.isnan(vals)]
+            n = len(vals)
+            if n > 0:
+                yf = np.fft.fft(vals)
+                amplitude = np.abs(yf)[:n//2] * 2 / n
+                freqs = np.fft.fftfreq(n, d=1.0)[:n//2]
+                
+                # 将频率转换为周期 (忽略频率0)
+                mask = freqs > 0
+                periods = 1.0 / freqs[mask]
+                amps = amplitude[mask]
+                
+                # 过滤掉过长的周期以便绘图更清晰 (可选：限制在数据长度的一半以内)
+                valid_mask = periods <= n/2
+                plot_periods = periods[valid_mask]
+                plot_amps = amps[valid_mask]
+
+                ax2.plot(plot_periods, plot_amps, color='#d62728')
+                ax2.set_xlabel("Period (Timesteps)")
+                ax2.set_ylabel("Amplitude")
+                ax2.set_xscale('log') # 使用对数坐标轴，因为周期跨度可能很大
+                ax2.grid(True, which="both", ls="-", alpha=0.5)
+                
+                # 标注最佳周期
+                if best_period > 0:
+                    ax2.axvline(x=best_period, color='green', linestyle='--', alpha=0.8, label=f'Best Period: {best_period}')
+                    ax2.legend()
+            else:
+                ax2.text(0.5, 0.5, "Data insufficient for FFT", ha='center')
+
+            # --- 图3: 趋势与季节性分解 (STL) ---
+            ax3 = axes[2]
+            title_text = f"3. Decomposition (STL) | Best Period: {best_period}"
+            if best_stl_res is not None:
+                # 绘制 STL 分解结果
+                # 为了在一张子图里显示，我们绘制 Trend 和 Seasonal
+                ax3.set_title(title_text, fontsize=12, fontweight='bold', loc='left')
+                
+                # 双轴绘制：左轴 Trend，右轴 Seasonal
+                ln1 = ax3.plot(best_stl_res.trend, color='#ff7f0e', label='Trend', linewidth=2)
+                ax3.set_ylabel("Trend Level")
+                
+                ax3_right = ax3.twinx()
+                ln2 = ax3_right.plot(best_stl_res.seasonal, color='#2ca02c', alpha=0.6, label='Seasonal', linewidth=1)
+                ax3_right.set_ylabel("Seasonal Component")
+                
+                # 合并图例
+                lns = ln1 + ln2
+                labs = [l.get_label() for l in lns]
+                ax3.legend(lns, labs, loc='upper right')
+                
+                ax3.grid(True, alpha=0.3)
+            else:
+                ax3.set_title(title_text + " (Failed or No Period)", fontsize=12, fontweight='bold', loc='left')
+                ax3.text(0.5, 0.5, "STL Decomposition Not Available", ha='center', transform=ax3.transAxes)
+
+            # 保存图片
+            save_path = os.path.join(save_dir, f"analysis_{item_id}.png")
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Plot saved to {save_path}")
+            
+        except Exception as e:
+            logger.error(f"Visualization failed for item {item_id}: {str(e)}", exc_info=True)
+        finally:
+            # 关闭图形以释放内存
+            plt.close(fig)
+
+    
     @classmethod
     def _validate_data_frame(cls, df: pd.DataFrame):
         """Validate that a pd.DataFrame with ITEMID and TIMESTAMP columns can be converted to TimeSeriesDataFrame"""
@@ -642,7 +1147,7 @@ class TimeSeriesDataFrame(pd.DataFrame):
         counts.index = self.index.levels[0][counts.index]
         return counts
 
-    def copy(self: TimeSeriesDataFrame, deep: bool = True) -> TimeSeriesDataFrame:
+    def copy(self: TimeSeriesDataFrame, deep: bool = True) -> TimeSeriesDataFrame: # type: ignore
         """Make a copy of the TimeSeriesDataFrame.
 
         When ``deep=True`` (default), a new object will be created with a copy of the calling object's data and
@@ -662,7 +1167,7 @@ class TimeSeriesDataFrame(pd.DataFrame):
                 setattr(obj, k, copy.deepcopy(getattr(obj, k)))
         return obj
 
-    def __finalize__(  # noqa
+    def __finalize__(  # noqa # type: ignore
         self: TimeSeriesDataFrame, other, method: str | None = None, **kwargs
     ) -> TimeSeriesDataFrame:
         super().__finalize__(other=other, method=method, **kwargs)
@@ -688,7 +1193,7 @@ class TimeSeriesDataFrame(pd.DataFrame):
             Data frame containing time series after the ``cutoff_time`` (include ``cutoff_time``).
         """
 
-        nanosecond_before_cutoff = cutoff_time - pd.Timedelta(nanoseconds=1)
+        nanosecond_before_cutoff = cutoff_time - pd.Timedelta(nanoseconds=1) # type: ignore
         data_before = self.loc[(slice(None), slice(None, nanosecond_before_cutoff)), :]
         data_after = self.loc[(slice(None), slice(cutoff_time, None)), :]
         before = TimeSeriesDataFrame(data_before, static_features=self.static_features)
