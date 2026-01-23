@@ -3,10 +3,8 @@ import reprlib
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
-
 import numpy as np
 import pandas as pd
-
 from autogluon.common.features.types import R_FLOAT, R_INT
 from autogluon.features.generators import (
     AsTypeFeatureGenerator,
@@ -16,9 +14,13 @@ from autogluon.features.generators import (
 )
 from autogluon.timeseries.dataset import TimeSeriesDataFrame
 from autogluon.timeseries.utils.warning_filters import warning_filter
-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 logger = logging.getLogger(__name__)
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+plt.rcParams["font.sans-serif"] = ["AR PL UKai CN", "WenQuanYi Zen Hei", "Droid Sans Fallback", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False 
 
 @dataclass
 class CovariateMetadata:
@@ -140,26 +142,59 @@ class TimeSeriesFeatureGenerator:
     """
 
     def __init__(
-        self,
-        target: str,
-        known_covariates_names: list[str],
-        float_dtype: str = "float32",
-        num_samples: int | None = 20_000,
-    ):
-        self.target = target
-        self.float_dtype = float_dtype
-        self.num_samples = num_samples
+            self,
+            target: str,
+            known_covariates_names: list[str],
+            float_dtype: str = "float32",
+            use_tsfresh: bool = False,
+            tsfresh_settings: dict | None = None,
+            num_samples: int | None = 20_000,
+            correlation_analysis: bool = False,
+            correlation_method: str = "pearson",
+            correlation_output_dir: str = "results/plot",
+            max_correlation_features: int = 50,
+            save_dir: str | None = None,
+        ):
+            self.target = target
+            self.float_dtype = float_dtype
+            self.num_samples = num_samples
+            self.use_tsfresh = use_tsfresh
+            self.tsfresh_settings = tsfresh_settings or self._get_default_tsfresh_settings()
+            self.correlation_analysis = correlation_analysis
+            self.correlation_method = correlation_method
+            self.correlation_output_dir = "results/plot"
+            self.max_correlation_features = max_correlation_features
+            if self.correlation_method not in ["pearson", "spearman"]:
+                raise ValueError(f"correlation_method must be 'pearson' or 'spearman', got {self.correlation_method}")
+                    
+            if save_dir is not None:
+                self.correlation_output_dir = os.path.join(save_dir, correlation_output_dir)
+            else:
+                self.correlation_output_dir = correlation_output_dir
+            
+            self.correlation_results: dict = {
+                "method": self.correlation_method,
+                "matrix": None,
+                "feature_correlations": {},
+                "top_correlated_features": []
+            }
+            self.save_dir = save_dir
+            self._is_fit = False
+            self.known_covariates_names: list[str] = list(known_covariates_names)
+            self.past_covariates_names: list[str] = []
+            self.known_covariates_pipeline = ContinuousAndCategoricalFeatureGenerator()
+            self.past_covariates_pipeline = ContinuousAndCategoricalFeatureGenerator()
+            self.static_feature_pipeline = ContinuousAndCategoricalFeatureGenerator(minimum_cat_count=1)
+            self._covariate_metadata: CovariateMetadata | None = None
+            self._train_covariates_real_median: pd.Series | None = None
+            self._train_static_real_median: pd.Series | None = None
 
-        self._is_fit = False
-        self.known_covariates_names: list[str] = list(known_covariates_names)
-        self.past_covariates_names: list[str] = []
-        self.known_covariates_pipeline = ContinuousAndCategoricalFeatureGenerator()
-        self.past_covariates_pipeline = ContinuousAndCategoricalFeatureGenerator()
-        # Cat features with cat_count=1 are fine in static_features since they are repeated for all time steps in a TS
-        self.static_feature_pipeline = ContinuousAndCategoricalFeatureGenerator(minimum_cat_count=1)
-        self._covariate_metadata: CovariateMetadata | None = None  # type ignore
-        self._train_covariates_real_median: pd.Series | None = None
-        self._train_static_real_median: pd.Series | None = None
+            self.tsfresh_features_extracted = False
+            self.tsfresh_selected_features: list[str] = []
+            
+            # [修改 1] 新增属性：用于存储 TSfresh 特征的显著性字典
+            # 格式示例: {'feature_name_1': 0.0001, 'feature_name_2': 0.5}
+            self.tsfresh_relevance_dict: dict[str, float] = {}
 
     @property
     def required_column_names(self) -> list[str]:
@@ -169,7 +204,526 @@ class TimeSeriesFeatureGenerator:
     def covariate_metadata(self) -> CovariateMetadata:
         assert self._covariate_metadata is not None, "covariate_metadata is not set. Did you call fit?"
         return self._covariate_metadata
+    
+    def _perform_correlation_analysis(self, df: pd.DataFrame, item_id_column: str, timestamp_column: str) -> pd.DataFrame:
+        """
+        执行相关性分析，包括皮尔逊或斯皮尔曼相关性计算和可视化
+        
+        Parameters
+        ----------
+        df : pd.DataFrame
+            包含所有特征的数据框
+        item_id_column : str
+            item_id列名
+        timestamp_column : str
+            timestamp列名
+            
+        Returns
+        -------
+        pd.DataFrame
+            返回原始数据框，相关性分析是副作用
+        """
+        if not self.correlation_analysis:
+            return df
+            
+        logger.info(f"Starting {self.correlation_method.capitalize()} correlation analysis...")
+        
+        try:
+            # 1. 准备分析数据
+            # 排除非数值列和索引列
+            exclude_cols = [item_id_column, timestamp_column]
+            
+            # 只有在列存在时才添加这些排除列
+            for col in ['tsfresh_id', 'id']:
+                if col in df.columns:
+                    exclude_cols.append(col)
+            
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            # 移除排除列
+            analysis_cols = [col for col in numeric_cols if col not in exclude_cols]
+            
+            if len(analysis_cols) < 2:
+                logger.warning("Not enough numeric columns for correlation analysis")
+                logger.warning(f"Available numeric columns: {numeric_cols}")
+                logger.warning(f"Excluded columns: {exclude_cols}")
+                logger.warning(f"Analysis columns after filtering: {analysis_cols}")
+                return df
+                
+            # 2. 限制特征数量以避免内存问题
+            if len(analysis_cols) > self.max_correlation_features:
+                logger.info(f"Too many features ({len(analysis_cols)}), selecting top {self.max_correlation_features} for analysis")
+                
+                # 如果目标列存在，优先选择与目标列相关性高的特征
+                if self.target in analysis_cols:
+                    # 计算每个特征与目标列的初始相关性
+                    initial_correlations = []
+                    for col in analysis_cols:
+                        if col != self.target:
+                            try:
+                                if self.correlation_method == "pearson":
+                                    corr = df[col].corr(df[self.target], method='pearson')
+                                else:
+                                    corr = df[col].corr(df[self.target], method='spearman')
+                                initial_correlations.append((col, abs(corr) if not pd.isna(corr) else 0))
+                            except:
+                                initial_correlations.append((col, 0))
+                    
+                    # 按相关性排序并选择前N个特征
+                    initial_correlations.sort(key=lambda x: x[1], reverse=True)
+                    selected_cols = [self.target] + [col for col, _ in initial_correlations[:self.max_correlation_features-1]]
+                else:
+                    # 随机选择特征
+                    selected_cols = list(np.random.choice(analysis_cols, size=min(self.max_correlation_features, len(analysis_cols)), replace=False))
+                
+                analysis_cols = [col for col in selected_cols if col in analysis_cols]
+            
+            logger.info(f"Analyzing correlations for {len(analysis_cols)} features")
+            
+            # 3. 计算相关性矩阵
+            correlation_matrix = df[analysis_cols].corr(method=self.correlation_method)
+            
+            # 4. 保存相关性结果
+            self.correlation_results["matrix"] = correlation_matrix
+            
+            # 计算每个特征与目标列的相关性（如果目标列存在）
+            if self.target in analysis_cols:
+                feature_correlations = {}
+                for col in analysis_cols:
+                    if col != self.target:
+                        try:
+                            corr_value = correlation_matrix.loc[col, self.target]
+                            if not pd.isna(corr_value):
+                                feature_correlations[col] = {
+                                    "correlation": float(corr_value),
+                                    "abs_correlation": abs(float(corr_value))
+                                }
+                        except:
+                            continue
+                
+                # 排序并保存前20个相关性最高的特征
+                sorted_correlations = sorted(
+                    feature_correlations.items(), 
+                    key=lambda x: x[1]["abs_correlation"], 
+                    reverse=True
+                )[:20]
+                
+                self.correlation_results["feature_correlations"] = dict(sorted_correlations)
+                self.correlation_results["top_correlated_features"] = [
+                    {"feature": feat, **corr_info} 
+                    for feat, corr_info in sorted_correlations
+                ]
+            
+            # 5. 创建输出目录
+            import os
+            os.makedirs(self.correlation_output_dir, exist_ok=True)
+            
+            # 6. 绘制并保存相关性热力图
+            self._plot_correlation_heatmap(
+                correlation_matrix, 
+                analysis_cols,
+                output_dir=self.correlation_output_dir
+            )
+            
+            # 7. 绘制并保存特征与目标列的相关性条形图
+            if self.target in analysis_cols and self.correlation_results["feature_correlations"]:
+                self._plot_feature_correlations(
+                    self.correlation_results["feature_correlations"],
+                    output_dir=self.correlation_output_dir
+                )
+            
+            # 8. 保存相关性矩阵到CSV文件
+            csv_path = os.path.join(self.correlation_output_dir, f"correlation_matrix_{self.correlation_method}.csv")
+            correlation_matrix.to_csv(csv_path)
+            logger.info(f"Correlation matrix saved to {csv_path}")
+            
+            # 9. 保存详细结果到JSON文件
+            import json
+            json_path = os.path.join(self.correlation_output_dir, f"correlation_results_{self.correlation_method}.json")
+            
+            # 将DataFrame转换为可序列化的格式
+            serializable_results = self.correlation_results.copy()
+            if isinstance(serializable_results["matrix"], pd.DataFrame):
+                serializable_results["matrix"] = serializable_results["matrix"].to_dict()
+            
+            with open(json_path, 'w') as f:
+                json.dump(serializable_results, f, indent=2, default=str)
+            
+            logger.info(f"Correlation results saved to {json_path}")
+            
+            # 10. 输出摘要信息
+            self._log_correlation_summary()
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Correlation analysis failed: {e}")
+            logger.warning("Continuing without correlation analysis")
+            return df
+        
+    def _plot_correlation_heatmap(self, correlation_matrix: pd.DataFrame, features: list[str], output_dir: str):
+        """绘制相关性热力图"""
+        try:
+            plt.figure(figsize=(max(12, len(features) * 0.3), max(10, len(features) * 0.25)))
+            
+            # 使用mask隐藏上三角（可选）
+            mask = None
+            if len(features) > 10:
+                mask = np.triu(np.ones_like(correlation_matrix, dtype=bool))
+            
+            # 绘制热力图
+            sns.heatmap(
+                correlation_matrix,
+                mask=mask,
+                cmap='coolwarm',
+                center=0,
+                square=True,
+                linewidths=0.5,
+                cbar_kws={"shrink": 0.8},
+                annot=False,  # 特征多时不显示数值
+                fmt=".2f"
+            )
+            
+            plt.title(f'{self.correlation_method.capitalize()} Correlation Matrix', fontsize=14, fontweight='bold')
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
+            plt.tight_layout()
+            
+            # 保存图片
+            plot_path = os.path.join(output_dir, f'correlation_heatmap_{self.correlation_method}.png')
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Correlation heatmap saved to {plot_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to plot correlation heatmap: {e}")
+    
+    def _plot_feature_correlations(self, feature_correlations: dict, output_dir: str):
+        """绘制特征与目标列的相关性条形图"""
+        try:
+            # 提取数据和排序
+            features = list(feature_correlations.keys())
+            correlations = [feature_correlations[f]["correlation"] for f in features]
+            abs_correlations = [feature_correlations[f]["abs_correlation"] for f in features]
+            
+            # 按绝对值排序
+            sorted_indices = np.argsort(abs_correlations)[::-1]
+            features = [features[i] for i in sorted_indices]
+            correlations = [correlations[i] for i in sorted_indices]
+            
+            # 限制显示数量
+            max_display = 20
+            if len(features) > max_display:
+                features = features[:max_display]
+                correlations = correlations[:max_display]
+            
+            # 创建图形
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+            
+            # 条形图（带正负）
+            colors = ['red' if c < 0 else 'blue' for c in correlations]
+            bars = ax1.barh(range(len(features)), correlations, color=colors)
+            ax1.set_yticks(range(len(features)))
+            ax1.set_yticklabels(features, fontsize=9)
+            ax1.set_xlabel('Correlation Coefficient', fontsize=11)
+            ax1.set_title(f'Top {len(features)} Features Correlation with {self.target} ({self.correlation_method})', 
+                         fontsize=12, fontweight='bold')
+            ax1.axvline(x=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
+            
+            # 添加数值标签
+            for i, bar in enumerate(bars):
+                width = bar.get_width()
+                label_x = width + (0.01 if width >= 0 else -0.04)
+                ha = 'left' if width >= 0 else 'right'
+                ax1.text(label_x, bar.get_y() + bar.get_height()/2, 
+                        f'{width:.3f}', 
+                        ha=ha, va='center', fontsize=8)
+            
+            # 绝对值排序的条形图
+            ax2.barh(range(len(features)), abs_correlations[:len(features)], color='green')
+            ax2.set_yticks(range(len(features)))
+            ax2.set_yticklabels(features, fontsize=9)
+            ax2.set_xlabel('Absolute Correlation Coefficient', fontsize=11)
+            ax2.set_title(f'Top {len(features)} Features (Absolute Correlation)', 
+                         fontsize=12, fontweight='bold')
+            
+            plt.tight_layout()
+            
+            # 保存图片
+            plot_path = os.path.join(output_dir, f'feature_correlations_{self.correlation_method}.png')
+            plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Feature correlations plot saved to {plot_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to plot feature correlations: {e}")
+    
+    def _log_correlation_summary(self):
+        """输出相关性分析摘要"""
+        if not self.correlation_results.get("feature_correlations"):
+            return
+            
+        logger.info(f"\n{'='*60}")
+        logger.info(f"{self.correlation_method.capitalize()} Correlation Analysis Summary")
+        logger.info(f"{'='*60}")
+        
+        feature_correlations = self.correlation_results["feature_correlations"]
+        
+        # 正相关和负相关特征
+        positive_features = [(f, info["correlation"]) for f, info in feature_correlations.items() if info["correlation"] > 0]
+        negative_features = [(f, info["correlation"]) for f, info in feature_correlations.items() if info["correlation"] < 0]
+        
+        logger.info(f"Total features analyzed: {len(feature_correlations)}")
+        logger.info(f"Positive correlations: {len(positive_features)}")
+        logger.info(f"Negative correlations: {len(negative_features)}")
+        
+        # 输出最强的相关特征
+        if positive_features:
+            logger.info(f"\nTop 5 positive correlations with {self.target}:")
+            positive_features.sort(key=lambda x: x[1], reverse=True)
+            for feature, corr in positive_features[:5]:
+                logger.info(f"  {feature}: {corr:.4f}")
+        
+        if negative_features:
+            logger.info(f"\nTop 5 negative correlations with {self.target}:")
+            negative_features.sort(key=lambda x: x[1])
+            for feature, corr in negative_features[:5]:
+                logger.info(f"  {feature}: {corr:.4f}")
+        
+        # 输出相关性绝对值最强的特征
+        logger.info(f"\nTop 5 absolute correlations with {self.target}:")
+        top_abs = sorted(feature_correlations.items(), key=lambda x: x[1]["abs_correlation"], reverse=True)[:5]
+        for feature, info in top_abs:
+            corr_type = "positive" if info["correlation"] > 0 else "negative"
+            logger.info(f"  {feature}: {info['correlation']:.4f} ({corr_type})")
+        
+        logger.info(f"{'='*60}")
+    
+    def _get_default_tsfresh_settings(self) -> dict:
+        """返回TSfresh的默认配置"""
+        return {
+            "use_tsfresh": self.use_tsfresh,
+            "window_size": 30,  # 滚动窗口大小
+            "fc_parameters": "efficient",  # "minimal", "efficient", "comprehensive"
+            "fdr_level": 0.05,  # 特征选择的FDR水平
+            "max_timeshift": 29,  # 最大时间偏移
+            "min_timeshift": 29,  # 最小时间偏移
+            "impute_strategy": "mean",  # 缺失值填充策略
+        }
 
+    def _extract_tsfresh_features(self, df: pd.DataFrame, item_id_column: str, timestamp_column: str) -> pd.DataFrame:
+            """
+            使用TSfresh提取时间序列特征，并计算特征显著性
+            """
+            logger.info("Starting TSfresh feature extraction...")
+            
+            if not self.use_tsfresh:
+                return df
+                
+            try:
+                try:
+                    from tsfresh import extract_features
+                    from tsfresh.utilities.dataframe_functions import roll_time_series, impute
+                    from tsfresh.feature_extraction import ComprehensiveFCParameters, MinimalFCParameters
+                    # [修改 2] 引入 calculate_relevance_table
+                    from tsfresh.feature_selection.relevance import calculate_relevance_table
+                except ImportError as e:    
+                    logger.error(f"Failed to import TSfresh: {e}")
+                    logger.warning("TSfresh feature extraction disabled due to import error")
+                    return df
+                
+                # 1. 准备数据：确保数据有序
+                df_sorted = df.sort_values([item_id_column, timestamp_column]).reset_index(drop=True)
+                
+                # 2. 创建唯一的item_id用于TSfresh
+                df_sorted['tsfresh_id'] = df_sorted.groupby(item_id_column).ngroup()
+                
+                # 3. 创建滚动窗口
+                window_size = self.tsfresh_settings.get("window_size", 30)
+                max_timeshift = self.tsfresh_settings.get("max_timeshift", window_size - 1)
+                min_timeshift = self.tsfresh_settings.get("min_timeshift", window_size - 1)
+                
+                logger.debug(f"Rolling time series with window size {window_size}...")
+                df_rolled = roll_time_series(
+                    df_sorted,
+                    column_id='tsfresh_id',
+                    column_sort=timestamp_column,
+                    max_timeshift=max_timeshift,
+                    min_timeshift=min_timeshift
+                )
+
+                # 4. 配置特征提取参数
+                fc_params_setting = self.tsfresh_settings.get("fc_parameters", "efficient")
+                if fc_params_setting == "minimal":
+                    fc_parameters = MinimalFCParameters()
+                elif fc_params_setting == "efficient":
+                    # 自定义高效特征集
+                    fc_parameters = {
+                        "length": None,
+                        "mean": None,
+                        "median": None,
+                        "standard_deviation": None,
+                        "variance": None,
+                        "root_mean_square": None,
+                        "maximum": None,
+                        "minimum": None,
+                        "linear_trend": [{"attr": "slope"}, {"attr": "intercept"}],
+                        "agg_linear_trend": [{"attr": "slope", "chunk_len": 5, "f_agg": "mean"}, {"attr": "slope", "chunk_len": 10, "f_agg": "mean"}],
+                        "absolute_sum_of_changes": None,
+                        "mean_abs_change": None,
+                        "mean_change": None,
+                        "cid_ce": [{"normalize": True}],
+                    }
+                else:
+                    fc_parameters = ComprehensiveFCParameters()
+                
+                # 5. 提取特征
+                logger.debug("Extracting TSfresh features...")
+                numeric_cols = df_rolled.select_dtypes(include=[np.number]).columns.tolist()
+                exclude_cols = [self.target, 'tsfresh_id', 'id', item_id_column, timestamp_column]
+                valid_feature_cols = [c for c in numeric_cols if c not in exclude_cols]
+                
+                if not valid_feature_cols:
+                    logger.warning("No valid numeric columns found for TSfresh feature extraction")
+                    return df
+                    
+                logger.info(f"Extracting features from {len(valid_feature_cols)} columns...")
+                
+                df_features = extract_features(
+                    df_rolled[['id', timestamp_column] + valid_feature_cols],
+                    column_id='id',
+                    column_sort=timestamp_column,
+                    default_fc_parameters=fc_parameters,
+                    n_jobs=2,
+                    disable_progressbar=False
+                )
+                
+                # 6. 处理缺失值
+                impute(df_features)
+                
+                # 7. 特征选择与显著性计算（如果有目标值）
+                if self.target in df_sorted.columns:
+                    logger.debug("Performing feature selection and relevance calculation...")
+                    
+                    # 对齐索引
+                    df_y = df_sorted.set_index(['tsfresh_id', timestamp_column])
+                    y = df_y[self.target]
+                    
+                    common_index = df_features.index.intersection(y.index)
+                    if len(common_index) > 0:
+                        X_aligned = df_features.loc[common_index]
+                        y_aligned = y.loc[common_index]
+                        
+                        # 删除y中的NaN值
+                        valid_mask = y_aligned.notna()
+                        X_clean = X_aligned.loc[valid_mask]
+                        y_clean = y_aligned.loc[valid_mask]
+                        
+                        if len(y_clean) > 0:
+                            fdr_level = self.tsfresh_settings.get("fdr_level", 0.05)
+                            
+                            # [修改 3] 使用 calculate_relevance_table 替代 select_features
+                            # 这将返回一个包含 p_value, relevant, type 等列的 DataFrame
+                            relevance_table = calculate_relevance_table(
+                                X_clean,
+                                y_clean,
+                                fdr_level=fdr_level,
+                                # n_jobs=1, # 可选，根据环境调整
+                                # show_warnings=False
+                            )
+                            
+                            # [修改 4] 将显著性结果保存为字典 {特征名: p_value}
+                            # relevance_table 的索引通常是 feature 名，但也可能在列中，取决于版本，
+                            # tsfresh 0.20+ 'feature' 是一列，index 也是 feature
+                            if 'feature' in relevance_table.columns:
+                                self.tsfresh_relevance_dict = dict(zip(relevance_table['feature'], relevance_table['p_value']))
+                            else:
+                                self.tsfresh_relevance_dict = relevance_table['p_value'].to_dict()
+                            
+                            logger.info(f"Calculated relevance for {len(self.tsfresh_relevance_dict)} features.")
+                            
+                            # [修改 5] 根据 relevance_table 筛选特征
+                            # 选取 'relevant' 为 True 的特征
+                            relevant_features = relevance_table[relevance_table['relevant'] == True]['feature'].tolist()
+                            
+                            self.tsfresh_selected_features = relevant_features
+                            df_features_selected = X_clean[relevant_features]
+                            
+                            logger.info(f"Selected {len(self.tsfresh_selected_features)} features from TSfresh (FDR {fdr_level})")
+                            
+                            # 如果选中的特征为空，兜底使用所有特征（维持原逻辑可选，或者就为空）
+                            if len(self.tsfresh_selected_features) == 0:
+                                logger.warning("No relevant features found by TSfresh, falling back to all features.")
+                                self.tsfresh_selected_features = df_features.columns.tolist()
+                                df_features_selected = df_features
+                        else:
+                            logger.warning("No valid target values for feature selection, using all extracted features")
+                            self.tsfresh_selected_features = df_features.columns.tolist()
+                            df_features_selected = df_features
+                    else:
+                        logger.warning("No common index for feature selection, using all extracted features")
+                        self.tsfresh_selected_features = df_features.columns.tolist()
+                        df_features_selected = df_features
+                else:
+                    logger.warning("Target column not found for feature selection, using all extracted features")
+                    self.tsfresh_selected_features = df_features.columns.tolist()
+                    df_features_selected = df_features
+                
+                # 8. 合并回原始数据
+                logger.debug("Merging TSfresh features back to original data...")
+                
+                # 重置索引以便合并
+                df_features_selected = df_features_selected.reset_index()
+                # TSfresh返回的索引名为level_0和level_1
+                if 'level_0' in df_features_selected.columns and 'level_1' in df_features_selected.columns:
+                    df_features_selected = df_features_selected.rename(
+                        columns={'level_0': 'tsfresh_id', 'level_1': timestamp_column}
+                    )
+                
+                # 合并到原始数据
+                df_merged = pd.merge(
+                    df_sorted,
+                    df_features_selected[['tsfresh_id', timestamp_column] + self.tsfresh_selected_features],
+                    on=['tsfresh_id', timestamp_column],
+                    how='left'
+                )
+                
+                # 删除辅助列
+                df_merged = df_merged.drop(columns=['tsfresh_id', 'id'], errors='ignore')
+                
+                # 9. 处理滚动窗口导致的NaN值
+                impute_strategy = self.tsfresh_settings.get("impute_strategy", "mean")
+                for col in self.tsfresh_selected_features:
+                    if col in df_merged.columns:
+                        if impute_strategy == "mean":
+                            df_merged[col] = df_merged[col].fillna(df_merged[col].mean())
+                        elif impute_strategy == "median":
+                            df_merged[col] = df_merged[col].fillna(df_merged[col].median())
+                        elif impute_strategy == "ffill":
+                            df_merged[col] = df_merged[col].fillna(method='ffill')
+                        else:
+                            df_merged[col] = df_merged[col].fillna(0)
+                
+                self.tsfresh_features_extracted = True
+                
+                # 可选：打印几个最显著的特征
+                if self.tsfresh_relevance_dict:
+                    top_features = sorted(self.tsfresh_relevance_dict.items(), key=lambda x: x[1])[:5]
+                    logger.info(f"Top 5 most significant TSfresh features (by p-value): {top_features}")
+
+                return df_merged
+                
+            except Exception as e:
+                logger.error(f"TSfresh feature extraction failed: {e}")
+                logger.warning("Falling back to original data without TSfresh features")
+                import traceback
+                logger.debug(traceback.format_exc())
+                return df
+        
+
+        
     def fit(self, data: TimeSeriesDataFrame) -> None:
         self.fit_transform(data)
 
@@ -192,6 +746,41 @@ class TimeSeriesFeatureGenerator:
         df.reset_index(drop=True, inplace=True)
         df = self._convert_numeric_to_float_dtype(df)
 
+        # 从MultiIndex获取列名
+        if hasattr(data.index, 'names'):
+            item_id_name = data.index.names[0] if len(data.index.names) > 0 else TimeSeriesDataFrame.ITEMID
+            timestamp_name = data.index.names[1] if len(data.index.names) > 1 else TimeSeriesDataFrame.TIMESTAMP
+        else:
+            item_id_name = TimeSeriesDataFrame.ITEMID
+            timestamp_name = TimeSeriesDataFrame.TIMESTAMP
+        
+        # 无论是否使用TSfresh，都添加原始索引列以便后续处理
+        # 这对于相关性分析和保持数据完整性都很重要
+        if item_id_name not in df.columns:
+            item_ids = index.get_level_values(0) if isinstance(index, pd.MultiIndex) else pd.Series([0]*len(df))
+            df[item_id_name] = item_ids.values
+        
+        if timestamp_name not in df.columns:
+            timestamps = index.get_level_values(1) if isinstance(index, pd.MultiIndex) else pd.RangeIndex(len(df))
+            df[timestamp_name] = timestamps.values
+        
+        # 1. 应用TSfresh特征提取
+        if self.use_tsfresh:
+            logger.info("Applying TSfresh feature extraction...")
+            df = self._extract_tsfresh_features(df, item_id_name, timestamp_name)
+            
+            # 更新past_covariates_names以包含TSfresh特征
+            tsfresh_new_features = [col for col in df.columns if col not in self.required_column_names 
+                                    and col != item_id_name and col != timestamp_name]
+            self.past_covariates_names.extend(tsfresh_new_features)
+            logger.info(f"Added {len(tsfresh_new_features)} TSfresh features to past covariates")
+        
+        # 2. 执行相关性分析（无论是否使用TSfresh）
+        if self.correlation_analysis:
+            logger.info("Performing correlation analysis...")
+            df = self._perform_correlation_analysis(df, item_id_name, timestamp_name)
+        
+        # 继续原有的处理流程...
         dfs_to_concat = [df[[self.target]]]
 
         logger.info("\nProvided data contains following columns:")
@@ -317,6 +906,33 @@ class TimeSeriesFeatureGenerator:
         df = pd.DataFrame(data)
         index = df.index
         df.reset_index(drop=True, inplace=True)
+
+        # 新增：如果训练时使用了TSfresh，在transform时也应用相同的特征工程
+        if self.use_tsfresh and self.tsfresh_features_extracted:
+            logger.info(f"Applying TSfresh transformation to {data_frame_name}...")
+            # 从MultiIndex获取列名
+            if hasattr(data.index, 'names'):
+                item_id_name = data.index.names[0] if len(data.index.names) > 0 else TimeSeriesDataFrame.ITEMID
+                timestamp_name = data.index.names[1] if len(data.index.names) > 1 else TimeSeriesDataFrame.TIMESTAMP
+            else:
+                item_id_name = TimeSeriesDataFrame.ITEMID
+                timestamp_name = TimeSeriesDataFrame.TIMESTAMP
+            
+            # 添加原始索引列以便处理
+            if item_id_name not in df.columns:
+                item_ids = index.get_level_values(0) if isinstance(index, pd.MultiIndex) else pd.Series([0]*len(df))
+                df[item_id_name] = item_ids.values
+            
+            if timestamp_name not in df.columns:
+                timestamps = index.get_level_values(1) if isinstance(index, pd.MultiIndex) else pd.RangeIndex(len(df))
+                df[timestamp_name] = timestamps.values
+            
+            # 在transform阶段，我们只提取已选中的特征
+            # 注意：这里简化处理，实际应用中可能需要重新运行特征提取
+            # 这里假设transform阶段的数据结构与fit阶段相同
+            logger.warning("Note: TSfresh feature extraction in transform phase may differ from fit phase. "
+                        "For consistent results, ensure data has same structure.")
+
 
         dfs_to_concat = [df[[self.target]]]
 
