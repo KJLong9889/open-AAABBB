@@ -159,6 +159,12 @@ class TimeSeriesPredictor:
         quantile_levels: list[float] | None = None,
         cache_predictions: bool = True,
         label: str | None = None,
+        use_tsfresh: bool = False,  # 新增参数
+        tsfresh_settings: dict | None = None,  # 新增参数
+        correlation_analysis: bool = False,  # 新增
+        correlation_method: str = "pearson",  # 新增
+        correlation_output_dir: str = "correlation_analysis",  # 新增
+        max_correlation_features: int = 50,  # 新增
         **kwargs,
     ):
         self.verbosity = verbosity
@@ -209,6 +215,7 @@ class TimeSeriesPredictor:
         if quantile_levels is None:
             quantile_levels = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
         self.quantile_levels = sorted(quantile_levels)
+        save = os.path.join("results", os.path.basename(self.path.rstrip(os.sep)))
         self._learner: TimeSeriesLearner = self._learner_type(
             path_context=self.path,
             eval_metric=self.eval_metric,
@@ -218,6 +225,13 @@ class TimeSeriesPredictor:
             quantile_levels=self.quantile_levels,
             cache_predictions=self.cache_predictions,
             ensemble_model_type=kwargs.pop("ensemble_model_type", None),
+            use_tsfresh=use_tsfresh,  # 传递参数
+            tsfresh_settings=tsfresh_settings,  # 传递参数
+            correlation_analysis=correlation_analysis,  # 传递参数
+            correlation_method=correlation_method,  # 传递参数
+            correlation_output_dir=correlation_output_dir,  # 传递参数
+            max_correlation_features=max_correlation_features,
+            save_dir=save,  # 传递参数
         )
 
         if len(kwargs) > 0:
@@ -289,7 +303,7 @@ class TimeSeriesPredictor:
         """
         df: TimeSeriesDataFrame = self._to_data_frame(data, name=name)
         #Kang*************************************
-        self._data_analysis_KANG(df, name=name)
+        # self._data_analysis_KANG(df, name=name)
         #Kang*************************************
         if not pd.api.types.is_numeric_dtype(df[self.target]):
             raise ValueError(f"Target column {name}['{self.target}'] has a non-numeric dtype {df[self.target].dtype}")
@@ -323,7 +337,7 @@ class TimeSeriesPredictor:
         return df
     
 
-    #Kang*************************************
+    #Kang*****************************************************************************************
     def _data_analysis_KANG(self, ts_df: TimeSeriesDataFrame, name: str = "data"):
         """Internal method to perform exploratory data analysis."""
         logger.info(f"\n{'='*80}")
@@ -331,23 +345,39 @@ class TimeSeriesPredictor:
         logger.info(f"{'='*80}")
 
         # 计算缺失率
-        try:
-            missing_stats = ts_df._compute_missing_rate_KANG(target_column=self.target)
-            if missing_stats is not None:
-                overall_missing = ts_df[self.target].isna().mean()
-                logger.info(f"Missing rate for target column '{self.target}': {overall_missing:.2%}")
-        except Exception as e:
-            logger.warning(f"Could not compute missing rate: {e}")
+        missing_dict = ts_df._compute_missing_rate_KANG()
+        
+        save = os.path.join("results", os.path.basename(self.path.rstrip(os.sep)))
+        # 绘制分布图
+
+        distribution_dict = ts_df._plot_distribution_KANG(save_dir=save)
             
-        # 绘制分布图（但不保存）
-        try:
-            fig = ts_df._plot_distribution_KANG(target_column=self.target)
-            import matplotlib.pyplot as plt
-            plt.show(block=False)  # 非阻塞显示
-            plt.pause(0.1)  # 短暂暂停以确保图形显示
-        except Exception as e:
-            logger.warning(f"Could not generate distribution plot: {e}")
-    #Kang*************************************
+
+            
+            # 使用已有的频率（如果已设置），否则尝试从数据推断
+        freq = self.freq
+        if freq is None:
+            try:
+                inferred_freq = ts_df.infer_frequency(num_items=10, raise_if_irregular=False)
+                if inferred_freq != ts_df.IRREGULAR_TIME_INDEX_FREQSTR:
+                    freq = inferred_freq
+                    logger.info(f"从数据推断的频率: {freq}")
+                else:
+                    logger.info("频率: 不规则 (无法推断或数据不规则)")
+            except Exception as e:
+                logger.warning(f"无法推断频率: {e}")
+                freq = None
+        else:
+            logger.info(f"使用的频率 (来自predictor配置): {freq}")
+        
+        # 进行时空异质性分析
+        heterogeneity_results = ts_df._spatiotemporal_heterogeneity_analysis_KANG(
+            target_column=self.target,
+            max_items=min(5, ts_df.num_items),
+            save_dir=save  # 最多分析5个时间序列
+        )
+            
+    #Kang*****************************************************************************************
 
     def _check_and_prepare_data_frame_for_evaluation(
         self, data: TimeSeriesDataFrame, cutoff: int | None = None, name: str = "data"
