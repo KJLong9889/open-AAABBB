@@ -31,6 +31,13 @@ class TimeSeriesLearner(AbstractLearner):
         prediction_length: int = 1,
         cache_predictions: bool = True,
         ensemble_model_type: Type | None = None,
+        use_tsfresh: bool = False,  # 新增参数
+        tsfresh_settings: dict | None = None,
+        correlation_analysis: bool = False,  # 新增
+        correlation_method: str = "pearson",  # 新增
+        correlation_output_dir: str = "correlation_analysis",  # 新增
+        max_correlation_features: int = 50,  # 新增  # 新增参数
+        save_dir: str | None = None,
         **kwargs,
     ):
         super().__init__(path_context=path_context)
@@ -43,9 +50,24 @@ class TimeSeriesLearner(AbstractLearner):
         self.cache_predictions = cache_predictions
         self.freq: str | None = None
         self.ensemble_model_type = ensemble_model_type
+        self.use_tsfresh = use_tsfresh  # 新增
+        self.tsfresh_settings = tsfresh_settings  # 新增
+        self.correlation_analysis = correlation_analysis  # 新增
+        self.correlation_method = correlation_method  # 新增
+        self.correlation_output_dir = correlation_output_dir  # 新增
+        self.max_correlation_features = max_correlation_features  # 新增
+        self.save_dir = save_dir
 
         self.feature_generator = TimeSeriesFeatureGenerator(
-            target=self.target, known_covariates_names=self.known_covariates_names
+            target=self.target, 
+            known_covariates_names=self.known_covariates_names, 
+            use_tsfresh=self.use_tsfresh, # 新增
+            tsfresh_settings=self.tsfresh_settings, # 新增
+            correlation_analysis=self.correlation_analysis,  # 传递参数
+            correlation_method=self.correlation_method,  # 传递参数
+            correlation_output_dir=self.correlation_output_dir,  # 传递参数
+            max_correlation_features=self.max_correlation_features,  # 传递参数
+            save_dir=self.save_dir
         )
 
     def load_trainer(self) -> TimeSeriesTrainer:  # type: ignore
