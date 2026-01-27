@@ -1,328 +1,333 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 import numpy as np
 import time
-from typing import Optional, Dict, Any
-import mamba_ssm
 import os
 import sys
+import shutil
+import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# 获取当前脚本所在的绝对路径 (即项目的根目录)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 手动添加各子模块的 src 目录到系统路径
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'common', 'src'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'core', 'src'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'features', 'src'))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, 'timeseries', 'src'))
+
 from autogluon.timeseries import TimeSeriesDataFrame
-from autogluon.timeseries.models.abstract import AbstractTimeSeriesModel
-# 1. 获取当前文件 (ag_TimeXer.py) 所在的目录
-# ----------------------------------------------------------------------
-# 1. 获取当前文件 (ag_TimeXer.py) 所在的目录
-current_dir = os.path.dirname(os.path.abspath(__file__))
+from autogluon.timeseries import TimeSeriesPredictor
+from autogluon.timeseries.utils.features import TimeSeriesFeatureGenerator
 
-# 2. 拼接出 timexer_lib 的绝对路径
-lib_path = os.path.join(current_dir, 'timexer_lib')
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('autogluon').setLevel(logging.WARNING)
 
-# 3. 检查文件夹是否存在
-if not os.path.exists(lib_path):
-    # 如果找不到，打印当前目录结构辅助调试
-    print(f"【错误】找不到 timexer_lib 文件夹！")
-    print(f"预期位置: {lib_path}")
-    print(f"当前目录 {current_dir} 下的文件: {os.listdir(current_dir) if os.path.exists(current_dir) else '目录不存在'}")
-    raise ImportError(f"请将 TimeXer 源码文件夹重命名为 'timexer_lib' 并放入 {current_dir} 目录下")
+os.environ["TABPFN_MODEL_CACHE_DIR"] = "checkpoints"
 
-# 4. 将 timexer_lib 加入系统路径 (优先级设为0，确保最先找到)
-# 注意：我们直接加入 lib_path，这样代码里就可以直接 import models, layers, utils
-if lib_path not in sys.path:
-    sys.path.insert(0, lib_path)
+# ====================== 路径配置 ======================
+INPUT_HISTORY_DIR = "data1"
+OUTPUT_DIR = "results/forecast_future"  # 修改输出目录以示区别
+MODEL_PATH_TEMPLATE = "AutogluonModels/AutogluonModels_{filename}"
+STATUS_FILE = "prediction_status.csv"   # 状态记录
 
-# 5. 尝试导入 TimeXer 模块
-try:
-    # 因为我们将 lib_path 加入了 sys.path，所以直接从 models 导入即可
-    # 这样也能解决 TimeXer 内部 "from layers import ..." 的路径问题
-    from models.TimeXer import Model as TimeXerNet
-    from utils.timefeatures import time_features
-    print("【成功】TimeXer 模块导入成功")
-except ImportError as e:
-    # 备用方案：有时候需要带上包名 (取决于你的 timexer_lib 内部是否有 __init__.py)
-    try:
-        if current_dir not in sys.path:
-            sys.path.insert(0, current_dir)
-        from timexer_lib.models.TimeXer import Model as TimeXerNet
-        from timexer_lib.utils.timefeatures import time_features
-        print("【成功】TimeXer 模块通过包名导入成功")
-    except ImportError as e2:
-        raise ImportError(f"TimeXer 导入失败。\n路径尝试1错误: {e}\n路径尝试2错误: {e2}")
+FORCE_DELETE_MODEL = True
+PREDICTION_LENGTH = 7  # 预测未来多少天
+
+# ====================== 核心字段 ======================
+ID_COLUMN = "item_id"
+TIMESTAMP_COLUMN = "date"
+TARGET_COLUMN = "value"
+
+# ====================== 已知未来协变量 ======================
+# 设为空，不再使用未来天气等数据
+KNOWN_COVARIATES = [] 
+
+# ====================== 集成策略配置函数 (已修复) ======================
+def get_ensemble_configs(ensemble_types):
+    """
+    根据用户指定的类型列表，生成 AutoGluon 的 ensemble_hyperparameters
     
-
-class TimeXerConfig:
+    支持类型: 
+      - 'weighted': 全局贪心加权 (最快，最稳)
+      - 'per_item': 分物品贪心加权 (适合不同商品规律差异大的情况)
+      - 'stacking': 全局堆叠 (Tabular Stacking)
+      - 'simple':   简单平均
+      - 'median':   中位数集成
+      - 'quantile': 分位数堆叠 (极慢，慎用)
     """
-    模拟 TimeXer 原生 args 对象，用于传递参数
-    """
-    def __init__(self, params: Dict[str, Any], pred_len: int, seq_len: int, enc_in: int, freq: str):
-        # 核心维度
-        self.seq_len = seq_len
-        self.label_len = seq_len // 2  # TimeXer 默认通常用一半作为 label_len
-        self.pred_len = pred_len
+    ensemble_hps = {}
+    
+    # 1. 全局加权集成 (WeightedEnsemble / Greedy) - 基础必备
+    if 'weighted' in ensemble_types:
+        ensemble_hps["WeightedEnsemble"] = {"max_models": 25} 
         
-        # 通道数 (AutoGluon 主要是单变量或多变量，这里简化为 enc_in=c_out)
-        self.enc_in = enc_in
-        self.dec_in = enc_in
-        self.c_out = enc_in 
+    # 2. 分物品加权集成 (PerItemGreedyEnsemble) - 进阶推荐
+    # 如果你的商品有些是 DeepAR 准，有些是 AutoETS 准，这个模型会自动切换
+    if 'per_item' in ensemble_types:
+        ensemble_hps["PerItemGreedyEnsemble"] = {"max_models": 25}
+
+    # 3. 堆叠集成 (TabularEnsemble / Stacking)
+    if 'stacking' in ensemble_types:
+        # 注意：如果特征过多(如开了TSfresh)，这里容易报维度错误
+        ensemble_hps["TabularEnsemble"] = {
+            "model_name": "CAT",  # 使用 CatBoost
+            "max_num_samples": 100000 
+        }
         
-        # 模型超参 (从 params 获取，或者使用默认值)
-        self.d_model = params.get('d_model', 512)
-        self.n_heads = params.get('n_heads', 8)
-        self.e_layers = params.get('e_layers', 2)
-        self.d_ff = params.get('d_ff', 2048)
-        self.dropout = params.get('dropout', 0.1)
-        self.embed = params.get('embed', 'timeF')
-        self.activation = params.get('activation', 'gelu')
-        self.output_attention = False
-        self.freq = freq
+    # 4. 简单平均 (SimpleAverage)
+    if 'simple' in ensemble_types:
+        ensemble_hps["SimpleAverage"] = {}
+
+    # 5. 中位数集成 (MedianEnsemble)
+    if 'median' in ensemble_types:
+        ensemble_hps["MedianEnsemble"] = {}
+    
+    # 6. 分位数堆叠 (PerQuantileTabularEnsemble) - 计算量巨大
+    if 'quantile' in ensemble_types:
+        ensemble_hps["PerQuantileTabularEnsemble"] = {
+            "model_name": "CAT",
+            "max_num_samples": 50000
+        }
         
-        # TimeXer 特有参数 (根据论文默认值设置)
-        self.use_norm = params.get('use_norm', True)
-        self.down_sampling_layers = params.get('down_sampling_layers', 0)
-        self.down_sampling_method = params.get('down_sampling_method', 'avg')
-        self.down_sampling_window = params.get('down_sampling_window', 1)
+    return ensemble_hps
 
-class TimeSeriesDataset(Dataset):
-    """
-    极简版 Dataset，适配 AutoGluon 的数据格式
-    """
-    def __init__(self, data_array, timestamps, seq_len, pred_len, freq):
-        self.data = data_array
-        self.timestamps = timestamps
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        self.freq = freq
-        
-        # 预计算时间特征
-        # 将 pandas timestamp 转为 TimeXer 需要的 (N, 4) 矩阵
-        df_stamp = pd.DataFrame({"date": timestamps})
-        self.data_stamp = time_features(df_stamp, freq=freq) # timeenc=1 for fixed
+# ====================== 时间特征函数 ======================
+def add_time_features(df, timestamp_col='date'):
+    df = df.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col])
+    df = df.sort_values(timestamp_col)
+    return df
 
-    def __len__(self):
-        # 简单的滑窗逻辑
-        return len(self.data) - self.seq_len - self.pred_len + 1
+# ====================== 单文件处理 ======================
+def process_file(history_file, ensemble_types=["weighted"]):
+    base_name = os.path.splitext(history_file)[0]
+    item_output_dir = os.path.join(OUTPUT_DIR, base_name)
+    os.makedirs(item_output_dir, exist_ok=True)
 
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end
-        r_end = r_begin + self.pred_len
+    try:
+        print(f"[Start] 正在处理: {base_name} | 集成策略: {ensemble_types}")
 
-        seq_x = self.data[s_begin:s_end]
-        seq_y = self.data[r_begin:r_end]
-        
-        seq_x_mark = self.data_stamp[s_begin:s_end]
-        seq_y_mark = self.data_stamp[r_begin:r_end]
+        # ---------- 读取全量历史数据 ----------
+        df = pd.read_csv(os.path.join(INPUT_HISTORY_DIR, history_file))
+        df[ID_COLUMN] = base_name
+        df = add_time_features(df, TIMESTAMP_COLUMN)
 
-        return (
-            torch.FloatTensor(seq_x),
-            torch.FloatTensor(seq_y),
-            torch.FloatTensor(seq_x_mark),
-            torch.FloatTensor(seq_y_mark)
+        # ---------- 字段检查 ----------
+        required_cols = [ID_COLUMN, TIMESTAMP_COLUMN, TARGET_COLUMN] + KNOWN_COVARIATES
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            return f"❌ {history_file} 缺少列: {missing}", None
+
+        df = df.sort_values(TIMESTAMP_COLUMN)
+
+        # ======================================================
+        # 全量数据构建 TimeSeriesDataFrame
+        # ======================================================
+        full_tsdf = TimeSeriesDataFrame.from_data_frame(
+            df,
+            id_column=ID_COLUMN,
+            timestamp_column=TIMESTAMP_COLUMN
         )
 
-class TimeXerModel(AbstractTimeSeriesModel):
-    """
-    AutoGluon 的 TimeXer 包装器
-    """
-    
-    # 声明支持的功能
-    _supports_known_covariates = False 
-    _supports_past_covariates = False
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.model = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.args = None
 
-    def _get_default_hyperparameters(self) -> dict:
-        return {
-            "d_model": 512,
-            "d_ff": 2048,
-            "e_layers": 2,
-            "n_heads": 8,
-            "dropout": 0.1,
-            "batch_size": 32,
-            "lr": 0.0001,
-            "epochs": 10,
-            "context_length_ratio": 2, # seq_len = prediction_length * ratio
+        # ======================================================
+        # 🏗️ Block 1 & 2: 统计与异质性分析 (基于全量数据)
+        # ======================================================
+        print(f"[Analysis] 数据分析 (Full Data)...")
+        full_tsdf._compute_missing_rate_KANG(save_dir=item_output_dir, save=True)
+        full_tsdf._plot_distribution_KANG(save_dir=item_output_dir, save=True)
+        full_tsdf._spatiotemporal_heterogeneity_analysis_KANG(
+            target=TARGET_COLUMN,
+            save_dir=item_output_dir,
+            save=True
+        )
+
+        # ======================================================
+        # Block 3: 特征工程分析
+        # ======================================================
+        print(f" [Feature] 特征工程分析...")
+        analysis_feature_generator = TimeSeriesFeatureGenerator(
+            target=TARGET_COLUMN,
+            known_covariates_names=KNOWN_COVARIATES,
+            use_tsfresh=False,            
+            correlation_analysis=True,    
+            correlation_method="pearson",
+            correlation_output_dir=os.path.join(item_output_dir, "correlation_analysis"),
+            max_correlation_features=50
+        )
+        full_tsdf = analysis_feature_generator.fit_transform(full_tsdf)
+
+        # ======================================================
+        # Block 4: 模型训练服务
+        # ======================================================
+        print(f"[Train] 模型全量训练...")
+
+        model_path = MODEL_PATH_TEMPLATE.format(filename=base_name)
+        if FORCE_DELETE_MODEL and os.path.exists(model_path):
+            shutil.rmtree(model_path)
+
+        predictor = TimeSeriesPredictor(
+            prediction_length=PREDICTION_LENGTH,
+            freq='D',
+            target=TARGET_COLUMN,
+            known_covariates_names=KNOWN_COVARIATES,
+            eval_metric="MSE", 
+            path=model_path,
+            use_tsfresh=False, 
+            correlation_analysis=False,
+            verbosity=3
+        )
+
+        # --- 获取修正后的集成配置 ---
+        ensemble_hps = get_ensemble_configs(ensemble_types)
+
+
+        predictor.fit(
+            train_data=full_tsdf,
+            time_limit=1200, 
+            enable_ensemble=True,
+            ensemble_hyperparameters=ensemble_hps, 
+            num_val_windows=1,
+            presets="fast_training",           
+            hyperparameters={
+                "TimeXer": {}
+            }
+        )
+        
+        # ======================================================
+        # New Block: 导出训练详情 (Leaderboard & Val Predictions)
+        # ======================================================
+        print(f"📝 [Export] 导出模型指标与验证集预测...")
+        
+        # 1. 导出 Leaderboard
+        leaderboard_df = predictor.leaderboard(data=full_tsdf, 
+                                               silent=True, 
+                                               extra_metrics=["MAE", "RMSE", "MAPE", "SMAPE", "RMSSE"]
+                        )
+        leaderboard_path = os.path.join(item_output_dir, f"{base_name}_model_leaderboard.csv")
+        leaderboard_df.to_csv(leaderboard_path, index=False, encoding='utf-8-sig')
+
+        # 2. 导出所有模型在验证集上的预测值
+        val_input_data = full_tsdf.slice_by_timestep(None, -PREDICTION_LENGTH)
+        
+        model_names = predictor.model_names()
+        
+        all_val_preds = []
+        for model_name in model_names:
+            try:
+                preds = predictor.predict(val_input_data, model=model_name)
+                preds = preds.reset_index()
+                preds['model'] = model_name 
+                all_val_preds.append(preds)
+            except Exception as e:
+                logging.warning(f"模型 {model_name} 验证集预测失败: {e}")
+
+        if all_val_preds:
+            combined_val_preds = pd.concat(all_val_preds, ignore_index=True)
+            
+            if "timestamp" in combined_val_preds.columns and TIMESTAMP_COLUMN != "timestamp":
+                combined_val_preds.rename(columns={"timestamp": TIMESTAMP_COLUMN}, inplace=True)
+            if "item_id" in combined_val_preds.columns and ID_COLUMN != "item_id":
+                combined_val_preds.rename(columns={"item_id": ID_COLUMN}, inplace=True)
+                
+            val_preds_path = os.path.join(item_output_dir, f"{base_name}_validation_predictions_all_models.csv")
+            combined_val_preds.to_csv(val_preds_path, index=False, encoding='utf-8-sig')
+        
+
+        # ======================================================
+        # Block 5: 构造未来数据并推理 (Future Forecast)
+        # ======================================================
+        print(f"[Predict] 未来预测...")
+
+        last_date = df[TIMESTAMP_COLUMN].max()
+        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=PREDICTION_LENGTH, freq='D')
+        
+        future_cov_df = pd.DataFrame({TIMESTAMP_COLUMN: future_dates})
+        future_cov_df[ID_COLUMN] = base_name
+        
+        future_tsdf = TimeSeriesDataFrame.from_data_frame(
+            future_cov_df,
+            id_column=ID_COLUMN,
+            timestamp_column=TIMESTAMP_COLUMN
+        )
+
+        predictions = predictor.predict(
+            data=full_tsdf,
+            known_covariates=future_tsdf
+        )
+
+        pred_df = predictions.reset_index()
+
+        if "timestamp" in pred_df.columns and TIMESTAMP_COLUMN != "timestamp":
+            pred_df.rename(columns={"timestamp": TIMESTAMP_COLUMN}, inplace=True)
+        if "item_id" in pred_df.columns and ID_COLUMN != "item_id":
+            pred_df.rename(columns={"item_id": ID_COLUMN}, inplace=True)
+
+        output_file = os.path.join(item_output_dir, f"{base_name}_future_prediction.csv")
+        pred_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+        status_info = {
+            'filename': history_file,
+            'status': 'Success',
+            'start_date': future_dates[0].strftime('%Y-%m-%d'),
+            'end_date': future_dates[-1].strftime('%Y-%m-%d'),
+            'models_trained': len(model_names),
+            'best_model': predictor.model_best
         }
 
-    def _fit(
-        self,
-        train_data: TimeSeriesDataFrame,
-        val_data: Optional[TimeSeriesDataFrame] = None,
-        time_limit: Optional[float] = None,
-        **kwargs,
-    ) -> None:
-        start_time = time.time()
-        
-        # 1. 数据预处理
-        # 填充缺失值，因为 TimeXer 不能处理 NaN
-        train_data = train_data.fill_missing_values()
-        
-        # 获取超参
-        params = self._hyperparameters
-        seq_len = int(self.prediction_length * params.get("context_length_ratio", 2))
-        
-        # 2. 准备配置 (Config)
-        # 自动推断频率
-        
-        freq_str = self.freq
-        
-        # 假设所有序列长度一致且对齐 (简化处理)，或者把所有序列拼在一起训练
-        # 这里为了稳健性，我们把所有 item_id 的序列分开做成 samples 然后 concat
-        all_samples = []
-        all_stamps = []
-        
-        # 将 AutoGluon 格式转换为 numpy
-        # 注意：这里假设是单变量预测。如果是多变量，需要处理 target 列之外的列
-        for item_id, group in train_data.groupby(level='item_id'):
-            values = group[self.target].values
-            timestamps = group.index.get_level_values('timestamp').values
-            if len(values) > seq_len + self.prediction_length:
-                # 为了简单，这里只取每个序列做训练，实际应该写得更高效
-                ds = TimeSeriesDataset(
-                    values.reshape(-1, 1), 
-                    timestamps, 
-                    seq_len, 
-                    self.prediction_length, 
-                    freq_str
-                )
-                # 使用 DataLoader 来利用 Dataset 的 __getitem__ 逻辑
-                # 但这里我们直接手动抽取所有滑窗可能太慢，
-                # 生产环境建议重写 Dataset 让它支持多序列索引
-                pass 
+        return (
+            f"{history_file} 完成 | 最佳模型: {predictor.model_best}"
+        ), status_info
 
-        # --- 简化版数据加载 (针对单序列或简单的多序列拼接) ---
-        # 我们直接使用第一个序列来初始化模型维度，实际应用需遍历
-        sample_item = train_data.iloc[0]
-        enc_in = 1 # 单变量
-        
-        self.args = TimeXerConfig(params, self.prediction_length, seq_len, enc_in, freq_str)
-        
-        # 3. 初始化模型
-        self.model = TimeXerNet(self.args).to(self.device)
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=params['lr'])
-        criterion = nn.MSELoss()
-        
-        # 4. 构建训练集
-        # 将所有时间序列视为独立样本
-        train_datasets = []
-        for item_id, group in train_data.groupby(level='item_id'):
-            values = group[self.target].values.reshape(-1, 1)
-            timestamps = group.index.get_level_values('timestamp')
-            if len(values) < seq_len + self.prediction_length:
-                continue
-            train_datasets.append(TimeSeriesDataset(values, timestamps, seq_len, self.prediction_length, freq_str))
-            
-        if not train_datasets:
-            raise ValueError("数据太短，无法进行训练")
-            
-        full_dataset = torch.utils.data.ConcatDataset(train_datasets)
-        train_loader = DataLoader(full_dataset, batch_size=params['batch_size'], shuffle=True)
+    except Exception as e:
+        import traceback
+        error_msg = f"{history_file} 失败\n{traceback.format_exc()[:300]}"
+        print(error_msg)
+        return error_msg, None
 
-        # 5. 训练循环
-        self.model.train()
-        for epoch in range(params['epochs']):
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
-                # 检查时间限制
-                if time_limit and (time.time() - start_time > time_limit):
-                    print("Time limit reached.")
-                    return
 
-                optimizer.zero_grad()
-                
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
-                batch_x_mark = batch_x_mark.to(self.device)
-                batch_y_mark = batch_y_mark.to(self.device)
-                
-                # Decoder input: 也就是 exp_long_term_forecasting 里的 dec_inp
-                # 策略: label_len 部分填真实值，pred_len 部分填 0
-                dec_inp = torch.zeros_like(batch_y[:, -self.prediction_length:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                
-                # Forward
-                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                
-                # TimeXer 输出通常不需要取特定维度，直接是 (B, L, D)
-                f_dim = -1 if self.args.enc_in > 1 else 0
-                outputs = outputs[:, -self.prediction_length:, :]
-                batch_y = batch_y[:, -self.prediction_length:, :]
+# ====================== 并行处理 ======================
+def batch_process_parallel(max_workers=4):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if not os.path.exists(INPUT_HISTORY_DIR):
+        print(f"找不到输入目录: {INPUT_HISTORY_DIR}")
+        return
 
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
-                
-            print(f"Epoch {epoch+1} loss: {loss.item()}")
+    files = [f for f in os.listdir(INPUT_HISTORY_DIR) if f.endswith(".csv")]
+    
+    if not files:
+        print(f"目录 {INPUT_HISTORY_DIR} 中没有 CSV 文件")
+        return
 
-    def _predict(
-        self,
-        data: TimeSeriesDataFrame,
-        known_covariates: Optional[TimeSeriesDataFrame] = None,
-        **kwargs,
-    ) -> TimeSeriesDataFrame:
-        self.model.eval()
-        data = data.fill_missing_values()
-        results = []
+    all_status = []
+    
+    # === 在这里定义你想要运行的集成类型 ===
+    USE_ENSEMBLES = ['weighted', 'stacking', 'simple', 'median', "per_item","quantile"] 
+    
+    print(f"开始全量训练与预测，共 {len(files)} 个文件...")
+    print(f"启用的集成策略: {USE_ENSEMBLES}")
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_file, f, USE_ENSEMBLES): f for f in files}
         
-        freq_map = {'H': 'h', 'T': 't', 'S': 's', 'M': 'm', 'A': 'a', 'W': 'w', 'D': 'd'}
-        freq_str = self.freq
-        
-        for item_id, group in data.groupby(level='item_id'):
-            # 准备输入数据 (取最后 seq_len 长度)
-            values = group[self.target].values
-            if len(values) < self.args.seq_len:
-                # Padding or simple error handling
-                pad_len = self.args.seq_len - len(values)
-                values = np.pad(values, (pad_len, 0), mode='edge')
-            else:
-                values = values[-self.args.seq_len:]
-                
-            # 准备时间戳 (需要生成未来的时间戳)
-            last_timestamp = group.index.get_level_values('timestamp')[-1]
-            future_timestamps = pd.date_range(
-                start=last_timestamp, 
-                periods=self.prediction_length + 1, 
-                freq=self.freq
-            )[1:] # 不包含最后一个已知点
-            
-            # 构造输入 Tensor
-            seq_x = torch.FloatTensor(values.reshape(1, -1, 1)).to(self.device)
-            
-            # 构造 Time Features
-            # 需要过去的时间戳 + 未来的时间戳
-            past_timestamps = group.index.get_level_values('timestamp')[-self.args.seq_len:]
-            all_timestamps = pd.concat([
-                pd.Series(past_timestamps), 
-                pd.Series(future_timestamps)
-            ])
-            df_stamp = pd.DataFrame({"date": all_timestamps})
-            data_stamp = time_features(df_stamp, timeenc=1, freq=freq_str)
-            data_stamp = torch.FloatTensor(data_stamp).unsqueeze(0).to(self.device)
-            
-            seq_x_mark = data_stamp[:, :self.args.seq_len, :]
-            seq_y_mark = data_stamp[:, self.args.seq_len:, :]
-            
-            # Decoder Input
-            dec_inp = torch.zeros(1, self.prediction_length, 1).float().to(self.device)
-            dec_inp = torch.cat([seq_x[:, -self.args.label_len:, :], dec_inp], dim=1)
-            
-            with torch.no_grad():
-                outputs = self.model(seq_x, seq_x_mark, dec_inp, seq_y_mark)
-                preds = outputs[:, -self.prediction_length:, 0].cpu().numpy().flatten()
-            
-            # 构造输出 DataFrame
-            item_df = pd.DataFrame({
-                "item_id": item_id,
-                "timestamp": future_timestamps,
-                "mean": preds
-            })
-            results.append(item_df)
-            
-        return TimeSeriesDataFrame(
-            pd.concat(results), 
-            static_features=data.static_features
-        )
+        for future in as_completed(futures):
+            result, status = future.result()
+            print(result)
+
+            if status is not None:
+                all_status.append(status)
+
+    if all_status:
+        status_df = pd.DataFrame(all_status)
+        status_path = os.path.join(OUTPUT_DIR, STATUS_FILE)
+        status_df.to_csv(status_path, index=False, encoding='utf-8-sig')
+        print(f"\n预测状态表已保存到: {status_path}")
+    else:
+        print("未完成任何预测")
+
+
+if __name__ == "__main__":
+    batch_process_parallel(max_workers=1)
+    print("任务全部完成")
