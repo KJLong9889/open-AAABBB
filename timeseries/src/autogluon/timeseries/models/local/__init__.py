@@ -13,3 +13,5 @@ from .statsforecast import (
     ThetaModel,
     ZeroModel,
 )
+from .moving_average import MovingAverageInterpolationModel
+from .ag_TimeXer import TimeXerModel
