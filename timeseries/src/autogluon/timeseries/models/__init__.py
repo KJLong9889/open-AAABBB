@@ -26,6 +26,8 @@ from .local import (
     SeasonalNaiveModel,
     ThetaModel,
     ZeroModel,
+    MovingAverageInterpolationModel,
+    TimeXerModel,
 )
 from .registry import ModelRegistry
 from .toto import TotoModel
@@ -61,4 +63,6 @@ __all__ = [
     "TotoModel",
     "WaveNetModel",
     "ZeroModel",
+    "MovingAverageInterpolationModel",
+    "TimeXerModel",
 ]
